@@ -2,12 +2,12 @@
 app/resolver/fallback_policy.py
 Strategy constants and ordering concepts for multi-provider fallback.
 
-Phase 3 (current):
-  PRIMARY  = Cobalt (3 instances tried in order)
-  FALLBACK = Invidious
-  DISABLED = Piped (code present, excluded from runtime)
+Phase 4 — pre-migration (current):
+  ACTIVE    = none (all public-instance providers disabled from runtime)
+  DISABLED  = cobalt, piped, invidious (code present, preserved for future)
+  PLANNED   = youtube_local_mp4 (first-party resolver — next prompt)
 
-Phase 4 (future): Deezer experimental.
+Phase 5 (next): youtube_local_mp4 as primary, public providers as optional fallback.
 
 DO NOT add new provider implementations here.
 DO NOT change runtime behavior — this file is configuration only.
@@ -47,15 +47,22 @@ class ProviderPolicy:
 
 
 # ---------------------------------------------------------------------------
-# Active runtime provider order (Phase 3)
+# Active runtime provider order (Phase 4 — pre-migration)
 #
-# index 0 = primary, tried first.
-# Piped remains disabled — its code is preserved for future reactivation.
+# ALL public-instance providers are currently disabled from runtime.
+# The next active provider (youtube_local_mp4) will be added in Phase 5.
+#
+# To re-enable a provider: move it from DISABLED_PROVIDERS to ACTIVE_PROVIDER_ORDER
+# and register its class instance in provider_manager._providers.
 # ---------------------------------------------------------------------------
-ACTIVE_PROVIDER_ORDER = ["cobalt", "invidious"]  # Phase 3: Cobalt primary, Invidious fallback
+ACTIVE_PROVIDER_ORDER: list = []  # no active providers until youtube_local_mp4 is added
 
 # Providers present in codebase but excluded from runtime selection.
-DISABLED_PROVIDERS = ["piped"]  # disabled: public instances unreliable
+DISABLED_PROVIDERS = [
+    "cobalt",     # public instances unreliable; code preserved
+    "piped",      # public instances unreliable; code preserved
+    "invidious",  # public instances unreliable; code preserved
+]
 
 DEFAULT_POLICY = ProviderPolicy(
     provider_names=ACTIVE_PROVIDER_ORDER,

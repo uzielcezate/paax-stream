@@ -2,12 +2,14 @@
 app/resolver/provider_manager.py
 Central orchestration layer for stream resolution.
 
-Phase 3 active provider order:
-  1. CobaltProvider    (primary — tries 3 instances; POST /api/json)
-  2. InvidiousProvider (fallback — if all Cobalt instances fail)
+Phase 4 (pre-migration) — no active providers:
+  All public-instance providers are disabled from runtime.
+  youtube_local_mp4 will become the primary active provider in the next prompt.
 
-Disabled (code retained, not loaded at runtime):
-  - PipedProvider      (public instances unreliable)
+Disabled (code retained for future use):
+  - CobaltProvider    (public instances unreliable)
+  - InvidiousProvider (public instances unreliable)
+  - PipedProvider     (public instances unreliable)
 
 Routes call provider_manager — they never import provider classes directly.
 The manager owns the in-memory cache so providers remain stateless.
@@ -15,10 +17,12 @@ The manager owns the in-memory cache so providers remain stateless.
 from typing import Dict, List, Optional
 
 from app.providers.base import StreamProvider, ResolvedStream, AudioFormat, ProviderStatus
-from app.providers.cobalt.provider import CobaltProvider
-from app.providers.invidious.provider import InvidiousProvider
-# PipedProvider is present in codebase but disabled from runtime.
-# Reactivate by un-commenting and adding PipedProvider() to _providers.
+# ---------------------------------------------------------------------------
+# All public-instance providers are disabled from runtime (Phase 4).
+# Un-comment and add to _providers below to re-enable any of them.
+# ---------------------------------------------------------------------------
+# from app.providers.cobalt.provider import CobaltProvider
+# from app.providers.invidious.provider import InvidiousProvider
 # from app.providers.piped.provider import PipedProvider
 from app.resolver.fallback_policy import DEFAULT_POLICY, FallbackStrategy
 from app.services.cache_service import stream_cache
@@ -39,21 +43,27 @@ class ProviderManager:
     """
 
     def __init__(self) -> None:
-        # ── Active providers (Phase 3) ──────────────────────────────────────
-        # Priority order: index 0 = primary, index 1 = fallback.
+        # ── Active providers (Phase 4 — pre-migration) ───────────────────────
+        # No public providers are active. youtube_local_mp4 will be registered
+        # here in the next prompt as the first-party primary provider.
         #
         # DISABLED (code retained, not loaded at runtime):
-        #   PipedProvider()  — re-add when reliable instances are available
-        self._providers: List[StreamProvider] = [
-            CobaltProvider(),    # primary  — POST /api/json, audio/mp4 tunnel
-            InvidiousProvider(), # fallback — GET /api/v1/videos/?local=true
-        ]
+        #   CobaltProvider()    — re-enable when reliable
+        #   InvidiousProvider() — re-enable when reliable
+        #   PipedProvider()     — re-enable when reliable
+        self._providers: List[StreamProvider] = []  # empty until youtube_local_mp4 is added
         self._policy = DEFAULT_POLICY
         log.info(
             "[ProviderManager] Initialised — providers=%s strategy=%s",
             [p.name for p in self._providers],
             self._policy.strategy.value,
         )
+        if not self._providers:
+            log.warning(
+                "[ProviderManager] No active providers registered. "
+                "All resolve calls will return PROVIDER_UNAVAILABLE until "
+                "youtube_local_mp4 is added."
+            )
 
     # ── Public interface used by routes ──────────────────────────────────────
 
