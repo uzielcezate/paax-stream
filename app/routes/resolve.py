@@ -2,20 +2,17 @@
 app/routes/resolve.py
 Stream resolution endpoints for paax-stream.
 
-GET /resolve/stream/{videoId}
-  → best playable audio URL (used by Flutter client for playback)
+Routes delegate ALL resolution logic to provider_manager.
+They never import Invidious classes or other provider internals directly.
 
-GET /resolve/formats/{videoId}
-  → all detected audio formats (debug / inspection)
+GET /resolve/stream/{videoId}  → best playable audio URL
+GET /resolve/formats/{videoId} → all audio formats (debug)
 """
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from app.config import PROVIDER_NAME
-from app.models import StreamResponse, FormatsResponse, AudioFormat, CacheInfo
-from app.services.invidious_service import fetch_audio_formats
-from app.services.stream_selector import select_best_audio, list_audio_formats
-from app.services.cache_service import stream_cache
+from app.resolver.provider_manager import provider_manager
+from app.models import StreamResponse, FormatsResponse
 from app.utils.logging import get_logger
 from app.utils.errors import (
     stream_error,
@@ -40,70 +37,55 @@ router = APIRouter(prefix="/resolve")
 )
 async def resolve_stream(videoId: str) -> JSONResponse:
     """
-    Resolve the single best playable audio stream URL for a YouTube videoId
-    via Invidious (?local=true).
+    Resolve the single best playable audio stream URL for a YouTube videoId.
 
+    Internally delegates to provider_manager → InvidiousProvider.
     Caches successful results in memory for CACHE_TTL_SECONDS.
     Does not cache failures.
 
-    Response shape:
-      { success, videoId, provider, streamUrl, mimeType, container, bitrate, cache }
+    Response: { success, videoId, provider, streamUrl, mimeType, container, bitrate, cache }
     """
     video_id = videoId.strip()
     log.info("[resolve/stream] → videoId=%s", video_id)
 
-    # ── 1. Cache check ─────────────────────────────────────────────────────────
-    cached = stream_cache.get(video_id)
-    if cached is not None:
-        log.info("[resolve/stream] Cache HIT for videoId=%s", video_id)
-        return JSONResponse(content={**cached, "cache": {"hit": True, "layer": "memory"}})
-
-    # ── 2. Fetch from Invidious ─────────────────────────────────────────────────
     try:
-        raw_formats = await fetch_audio_formats(video_id)
+        result = await provider_manager.resolve_stream(video_id)
+        log.info(
+            "[resolve/stream] OK videoId=%s mimeType=%s bitrate=%d provider=%s cached=%s",
+            video_id,
+            result.get("mimeType"),
+            result.get("bitrate", 0),
+            result.get("provider"),
+            result.get("cache", {}).get("hit"),
+        )
+        return JSONResponse(content=result)
+
     except InvalidVideoIdError as exc:
         log.warning("[resolve/stream] Invalid videoId=%s: %s", video_id, exc)
         return stream_error(video_id, "INVALID_VIDEO_ID", str(exc), http_status=400)
-    except InvidiousTimeoutError as exc:
+
+    except InvidiousTimeoutError:
         log.error("[resolve/stream] Timeout for videoId=%s", video_id)
         return stream_error(video_id, "PROVIDER_TIMEOUT",
-                            "Invidious request timed out", http_status=504)
+                            "Provider request timed out", http_status=504)
+
     except InvidiousUpstreamError as exc:
-        log.error("[resolve/stream] Upstream error HTTP %d for videoId=%s",
+        log.error("[resolve/stream] Upstream error HTTP %d videoId=%s",
                   exc.status_code, video_id)
         return stream_error(
             video_id, "PROVIDER_ERROR",
-            f"Invidious returned HTTP {exc.status_code}",
+            f"Provider returned HTTP {exc.status_code}",
             http_status=502,
         )
+
     except NoAudioFormatsError as exc:
-        log.warning("[resolve/stream] No audio formats for videoId=%s", video_id)
+        log.warning("[resolve/stream] No audio formats videoId=%s", video_id)
         return stream_error(video_id, "NO_AUDIO_FORMATS", str(exc), http_status=422)
 
-    # ── 3. Select best format ──────────────────────────────────────────────────
-    try:
-        best = select_best_audio(raw_formats)
-    except NoAudioFormatsError as exc:
-        return stream_error(video_id, "NO_AUDIO_FORMATS", str(exc), http_status=422)
-
-    # ── 4. Build response + prime cache ───────────────────────────────────────
-    payload = {
-        "success":   True,
-        "videoId":   video_id,
-        "provider":  PROVIDER_NAME,
-        "streamUrl": best["url"],
-        "mimeType":  best["mimeType"],
-        "container": best["container"],
-        "bitrate":   best["bitrate"],
-    }
-    stream_cache.set(video_id, payload)
-
-    log.info(
-        "[resolve/stream] OK videoId=%s mimeType=%s bitrate=%d provider=%s",
-        video_id, best["mimeType"], best["bitrate"], PROVIDER_NAME,
-    )
-
-    return JSONResponse(content={**payload, "cache": {"hit": False, "layer": "provider"}})
+    except Exception as exc:
+        log.error("[resolve/stream] Unexpected error videoId=%s: %s", video_id, exc)
+        return stream_error(video_id, "INTERNAL_ERROR",
+                            "Unexpected resolver error", http_status=500)
 
 
 # ---------------------------------------------------------------------------
@@ -117,34 +99,35 @@ async def resolve_stream(videoId: str) -> JSONResponse:
 )
 async def resolve_formats(videoId: str) -> JSONResponse:
     """
-    Returns all audio-only formats for a videoId.
-    Sorted: mp4/m4a first (by bitrate desc), then webm/opus.
+    Returns all audio-only formats for a videoId via the primary provider.
+    Sorted: mp4/m4a first by bitrate desc, then webm/opus.
     Intended for debugging — not called by the Flutter client in production.
     """
     video_id = videoId.strip()
     log.info("[resolve/formats] → videoId=%s", video_id)
 
     try:
-        raw_formats = await fetch_audio_formats(video_id)
+        result = await provider_manager.resolve_formats(video_id)
+        log.info("[resolve/formats] OK videoId=%s formats=%d",
+                 video_id, len(result.get("formats", [])))
+        return JSONResponse(content=result)
+
     except InvalidVideoIdError as exc:
         return stream_error(video_id, "INVALID_VIDEO_ID", str(exc), http_status=400)
+
     except InvidiousTimeoutError:
         return stream_error(video_id, "PROVIDER_TIMEOUT",
-                            "Invidious request timed out", http_status=504)
+                            "Provider request timed out", http_status=504)
+
     except InvidiousUpstreamError as exc:
         return stream_error(video_id, "PROVIDER_ERROR",
-                            f"Invidious returned HTTP {exc.status_code}",
+                            f"Provider returned HTTP {exc.status_code}",
                             http_status=502)
+
     except NoAudioFormatsError as exc:
         return stream_error(video_id, "NO_AUDIO_FORMATS", str(exc), http_status=422)
 
-    normalized = list_audio_formats(raw_formats)
-
-    log.info("[resolve/formats] videoId=%s found %d formats", video_id, len(normalized))
-
-    return JSONResponse(content={
-        "success":  True,
-        "videoId":  video_id,
-        "provider": PROVIDER_NAME,
-        "formats":  normalized,
-    })
+    except Exception as exc:
+        log.error("[resolve/formats] Unexpected error videoId=%s: %s", video_id, exc)
+        return stream_error(video_id, "INTERNAL_ERROR",
+                            "Unexpected resolver error", http_status=500)
