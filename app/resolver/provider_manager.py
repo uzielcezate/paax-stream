@@ -2,9 +2,13 @@
 app/resolver/provider_manager.py
 Central orchestration layer for stream resolution.
 
-Phase 2 provider order:
-  1. PipedProvider     (primary — tries 3 instances internally)
-  2. InvidiousProvider (fallback — if all Piped instances fail)
+Phase 2b active provider order:
+  1. InvidiousProvider  (only active provider for now)
+
+Disabled (code kept for reactivation):
+  - PipedProvider       (public instances unreliable)
+
+Phase 3 (next prompt): CobaltProvider will be inserted at index 0.
 
 Routes call provider_manager — they never import provider classes directly.
 The manager owns the in-memory cache so providers remain stateless.
@@ -12,7 +16,9 @@ The manager owns the in-memory cache so providers remain stateless.
 from typing import Dict, List, Optional
 
 from app.providers.base import StreamProvider, ResolvedStream, AudioFormat, ProviderStatus
-from app.providers.piped.provider import PipedProvider
+# PipedProvider is present in codebase but disabled from runtime (Phase 2b).
+# Reactivate by un-commenting the import and adding PipedProvider() to _providers below.
+# from app.providers.piped.provider import PipedProvider
 from app.providers.invidious.provider import InvidiousProvider
 from app.resolver.fallback_policy import DEFAULT_POLICY, FallbackStrategy
 from app.services.cache_service import stream_cache
@@ -33,10 +39,14 @@ class ProviderManager:
     """
 
     def __init__(self) -> None:
-        # Priority order: Piped first, Invidious as fallback
+        # ── Active providers (Phase 2b) ─────────────────────────────────────
+        # Priority order: index 0 = primary.
+        # CobaltProvider will be prepended here in Phase 3.
+        #
+        # DISABLED (code retained, not loaded at runtime):
+        #   PipedProvider()  — re-add when reliable instances are available
         self._providers: List[StreamProvider] = [
-            PipedProvider(),
-            InvidiousProvider(),
+            InvidiousProvider(),   # only active provider for now
         ]
         self._policy = DEFAULT_POLICY
         log.info(

@@ -2,12 +2,13 @@
 app/resolver/fallback_policy.py
 Strategy constants and ordering concepts for multi-provider fallback.
 
-Phase 2 (current):
-  PRIMARY  = Piped  (tries 3 instances in order)
-  FALLBACK = Invidious
+Phase 2b (current):
+  ACTIVE    = Invidious only
+  DISABLED  = Piped (code present, excluded from runtime — public instances unreliable)
+  PLANNED   = Cobalt (next primary once implemented)
 
-Phase 3 (planned): Cobalt experimental.
-Phase 4 (planned): Deezer experimental.
+Phase 3 (next): Cobalt primary + Invidious fallback.
+Phase 4 (future): Deezer experimental.
 
 DO NOT add new provider implementations here.
 DO NOT change runtime behavior — this file is configuration only.
@@ -46,9 +47,21 @@ class ProviderPolicy:
     max_attempts:              int              = 1  # per provider
 
 
-# Phase 2 default policy: Piped primary, Invidious fallback
+# ---------------------------------------------------------------------------
+# Active runtime provider order (Phase 2b)
+#
+# Only providers listed here are used at runtime.
+# Piped is intentionally excluded — its code is preserved for reactivation.
+# Cobalt will be inserted before Invidious once implemented (Phase 3).
+# ---------------------------------------------------------------------------
+ACTIVE_PROVIDER_ORDER = ["invidious"]  # Phase 2b: Invidious only
+
+# Providers present in codebase but excluded from runtime selection.
+# Remove from this list to reactivate.
+DISABLED_PROVIDERS = ["piped"]  # disabled: public instances unreliable
+
 DEFAULT_POLICY = ProviderPolicy(
-    provider_names=["piped", "invidious"],
+    provider_names=ACTIVE_PROVIDER_ORDER,
     strategy=ACTIVE_STRATEGY,
 )
 
