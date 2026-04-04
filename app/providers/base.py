@@ -27,7 +27,8 @@ class ResolvedStream:
     stream_url: str
     mime_type:  str
     container:  str
-    bitrate:    int  # bps
+    bitrate:    int          # bps
+    height:     int = 0     # px; 0 = not applicable (audio-only providers)
 
 
 @dataclass

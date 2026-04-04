@@ -2,9 +2,8 @@
 app/resolver/provider_manager.py
 Central orchestration layer for stream resolution.
 
-Phase 4 (pre-migration) — no active providers:
-  All public-instance providers are disabled from runtime.
-  youtube_local_mp4 will become the primary active provider in the next prompt.
+Phase 5 active provider:
+  1. YouTubeLocalMP4Provider  (first-party yt-dlp; MP4 144p/240p/360p)
 
 Disabled (code retained for future use):
   - CobaltProvider    (public instances unreliable)
@@ -17,8 +16,9 @@ The manager owns the in-memory cache so providers remain stateless.
 from typing import Dict, List, Optional
 
 from app.providers.base import StreamProvider, ResolvedStream, AudioFormat, ProviderStatus
+from app.providers.youtube_local_mp4.provider import YouTubeLocalMP4Provider
 # ---------------------------------------------------------------------------
-# All public-instance providers are disabled from runtime (Phase 4).
+# Public-instance providers are disabled from runtime (Phase 5).
 # Un-comment and add to _providers below to re-enable any of them.
 # ---------------------------------------------------------------------------
 # from app.providers.cobalt.provider import CobaltProvider
@@ -43,27 +43,23 @@ class ProviderManager:
     """
 
     def __init__(self) -> None:
-        # ── Active providers (Phase 4 — pre-migration) ───────────────────────
-        # No public providers are active. youtube_local_mp4 will be registered
-        # here in the next prompt as the first-party primary provider.
+        # ── Active providers (Phase 5) ────────────────────────────────────
+        # First-party local resolver is the only active provider.
+        # Public providers remain commented out / disabled.
         #
         # DISABLED (code retained, not loaded at runtime):
         #   CobaltProvider()    — re-enable when reliable
         #   InvidiousProvider() — re-enable when reliable
         #   PipedProvider()     — re-enable when reliable
-        self._providers: List[StreamProvider] = []  # empty until youtube_local_mp4 is added
+        self._providers: List[StreamProvider] = [
+            YouTubeLocalMP4Provider(),  # primary — yt-dlp, MP4 144p/240p/360p
+        ]
         self._policy = DEFAULT_POLICY
         log.info(
             "[ProviderManager] Initialised — providers=%s strategy=%s",
             [p.name for p in self._providers],
             self._policy.strategy.value,
         )
-        if not self._providers:
-            log.warning(
-                "[ProviderManager] No active providers registered. "
-                "All resolve calls will return PROVIDER_UNAVAILABLE until "
-                "youtube_local_mp4 is added."
-            )
 
     # ── Public interface used by routes ──────────────────────────────────────
 
@@ -133,6 +129,7 @@ class ProviderManager:
             "mimeType":  result.mime_type,
             "container": result.container,
             "bitrate":   result.bitrate,
+            "height":    result.height,  # px; 0 for audio-only providers
         }
         stream_cache.set(video_id, payload)
 

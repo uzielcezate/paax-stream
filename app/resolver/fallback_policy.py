@@ -2,12 +2,11 @@
 app/resolver/fallback_policy.py
 Strategy constants and ordering concepts for multi-provider fallback.
 
-Phase 4 — pre-migration (current):
-  ACTIVE    = none (all public-instance providers disabled from runtime)
-  DISABLED  = cobalt, piped, invidious (code present, preserved for future)
-  PLANNED   = youtube_local_mp4 (first-party resolver — next prompt)
+Phase 5 (current):
+  PRIMARY  = youtube_local_mp4 (first-party yt-dlp backend resolver)
+  DISABLED = cobalt, piped, invidious (code present, excluded from runtime)
 
-Phase 5 (next): youtube_local_mp4 as primary, public providers as optional fallback.
+Phase 6 (future): add a public-instance fallback when youtube_local_mp4 fails.
 
 DO NOT add new provider implementations here.
 DO NOT change runtime behavior — this file is configuration only.
@@ -47,15 +46,14 @@ class ProviderPolicy:
 
 
 # ---------------------------------------------------------------------------
-# Active runtime provider order (Phase 4 — pre-migration)
+# Active runtime provider order (Phase 5)
 #
-# ALL public-instance providers are currently disabled from runtime.
-# The next active provider (youtube_local_mp4) will be added in Phase 5.
-#
-# To re-enable a provider: move it from DISABLED_PROVIDERS to ACTIVE_PROVIDER_ORDER
-# and register its class instance in provider_manager._providers.
+# youtube_local_mp4 is the only active provider.
+# Public-instance providers remain in code but are disabled from runtime.
+# To re-enable a public provider: add it after youtube_local_mp4 here and
+# register its class instance in provider_manager._providers.
 # ---------------------------------------------------------------------------
-ACTIVE_PROVIDER_ORDER: list = []  # no active providers until youtube_local_mp4 is added
+ACTIVE_PROVIDER_ORDER = ["youtube_local_mp4"]  # first-party; no public proxies
 
 # Providers present in codebase but excluded from runtime selection.
 DISABLED_PROVIDERS = [
