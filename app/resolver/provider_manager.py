@@ -2,13 +2,12 @@
 app/resolver/provider_manager.py
 Central orchestration layer for stream resolution.
 
-Phase 2b active provider order:
-  1. InvidiousProvider  (only active provider for now)
+Phase 3 active provider order:
+  1. CobaltProvider    (primary — tries 3 instances; POST /api/json)
+  2. InvidiousProvider (fallback — if all Cobalt instances fail)
 
-Disabled (code kept for reactivation):
-  - PipedProvider       (public instances unreliable)
-
-Phase 3 (next prompt): CobaltProvider will be inserted at index 0.
+Disabled (code retained, not loaded at runtime):
+  - PipedProvider      (public instances unreliable)
 
 Routes call provider_manager — they never import provider classes directly.
 The manager owns the in-memory cache so providers remain stateless.
@@ -16,10 +15,11 @@ The manager owns the in-memory cache so providers remain stateless.
 from typing import Dict, List, Optional
 
 from app.providers.base import StreamProvider, ResolvedStream, AudioFormat, ProviderStatus
-# PipedProvider is present in codebase but disabled from runtime (Phase 2b).
-# Reactivate by un-commenting the import and adding PipedProvider() to _providers below.
-# from app.providers.piped.provider import PipedProvider
+from app.providers.cobalt.provider import CobaltProvider
 from app.providers.invidious.provider import InvidiousProvider
+# PipedProvider is present in codebase but disabled from runtime.
+# Reactivate by un-commenting and adding PipedProvider() to _providers.
+# from app.providers.piped.provider import PipedProvider
 from app.resolver.fallback_policy import DEFAULT_POLICY, FallbackStrategy
 from app.services.cache_service import stream_cache
 from app.utils.logging import get_logger
@@ -39,14 +39,14 @@ class ProviderManager:
     """
 
     def __init__(self) -> None:
-        # ── Active providers (Phase 2b) ─────────────────────────────────────
-        # Priority order: index 0 = primary.
-        # CobaltProvider will be prepended here in Phase 3.
+        # ── Active providers (Phase 3) ──────────────────────────────────────
+        # Priority order: index 0 = primary, index 1 = fallback.
         #
         # DISABLED (code retained, not loaded at runtime):
         #   PipedProvider()  — re-add when reliable instances are available
         self._providers: List[StreamProvider] = [
-            InvidiousProvider(),   # only active provider for now
+            CobaltProvider(),    # primary  — POST /api/json, audio/mp4 tunnel
+            InvidiousProvider(), # fallback — GET /api/v1/videos/?local=true
         ]
         self._policy = DEFAULT_POLICY
         log.info(
