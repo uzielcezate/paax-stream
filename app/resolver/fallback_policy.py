@@ -2,11 +2,12 @@
 app/resolver/fallback_policy.py
 Strategy constants and ordering concepts for multi-provider fallback.
 
-Phase 1: Invidious is the only active provider.
-         This module defines the structure for future expansion.
+Phase 2 (current):
+  PRIMARY  = Piped  (tries 3 instances in order)
+  FALLBACK = Invidious
 
-Phase 2 (planned): automatic fallback chain —
-  Invidious → Piped → Cobalt (experimental)
+Phase 3 (planned): Cobalt experimental.
+Phase 4 (planned): Deezer experimental.
 
 DO NOT add new provider implementations here.
 DO NOT change runtime behavior — this file is configuration only.
@@ -20,35 +21,34 @@ from typing import List
 
 class FallbackStrategy(str, Enum):
     """
-    How provider_manager should behave when the primary provider fails.
+    How provider_manager behaves when the primary provider fails.
 
-    FIRST_SUCCESS  — try each provider in order; return the first success.
-    PRIMARY_ONLY   — use only the first (primary) provider; never fall back.
+    FIRST_SUCCESS  — try each provider in order; return on first success.
+    PRIMARY_ONLY   — use only the first provider; never fall back.
     """
     FIRST_SUCCESS = "first_success"
     PRIMARY_ONLY  = "primary_only"
 
 
-# Active strategy for Phase 1.
-# Change to FIRST_SUCCESS when additional providers are registered.
-ACTIVE_STRATEGY: FallbackStrategy = FallbackStrategy.PRIMARY_ONLY
+# Phase 2: FIRST_SUCCESS — Piped → Invidious fallback
+ACTIVE_STRATEGY: FallbackStrategy = FallbackStrategy.FIRST_SUCCESS
 
 
 @dataclass
 class ProviderPolicy:
     """
-    Ordered list of provider names and the fallback strategy to apply.
-
-    provider_names is the priority order: index 0 is primary.
+    Ordered provider list + fallback strategy.
+    provider_names[0] is the primary provider.
     """
-    provider_names: List[str]            = field(default_factory=list)
-    strategy:       FallbackStrategy     = FallbackStrategy.PRIMARY_ONLY
-    timeout_per_provider_s: float        = 10.0
-    max_attempts: int                    = 1  # per provider in FIRST_SUCCESS mode
+    provider_names:            List[str]        = field(default_factory=list)
+    strategy:                  FallbackStrategy = FallbackStrategy.FIRST_SUCCESS
+    timeout_per_provider_s:    float            = 10.0
+    max_attempts:              int              = 1  # per provider
 
 
-# Default policy — single active provider
+# Phase 2 default policy: Piped primary, Invidious fallback
 DEFAULT_POLICY = ProviderPolicy(
-    provider_names=["invidious"],
+    provider_names=["piped", "invidious"],
     strategy=ACTIVE_STRATEGY,
 )
+

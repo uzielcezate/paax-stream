@@ -2,21 +2,21 @@
 app/resolver/provider_manager.py
 Central orchestration layer for stream resolution.
 
+Phase 2 provider order:
+  1. PipedProvider     (primary — tries 3 instances internally)
+  2. InvidiousProvider (fallback — if all Piped instances fail)
+
 Routes call provider_manager — they never import provider classes directly.
-
-Phase 1: Orchestrates a single provider (Invidious).
-Phase 2: Will iterate providers per FallbackStrategy when multiple are registered.
-
-The manager also owns the in-memory cache so providers remain stateless.
+The manager owns the in-memory cache so providers remain stateless.
 """
 from typing import Dict, List, Optional
 
 from app.providers.base import StreamProvider, ResolvedStream, AudioFormat, ProviderStatus
+from app.providers.piped.provider import PipedProvider
 from app.providers.invidious.provider import InvidiousProvider
 from app.resolver.fallback_policy import DEFAULT_POLICY, FallbackStrategy
 from app.services.cache_service import stream_cache
 from app.utils.logging import get_logger
-from app.utils.errors import NoAudioFormatsError
 
 log = get_logger(__name__)
 
@@ -26,15 +26,16 @@ class ProviderManager:
     Orchestrates registered providers for stream resolution.
 
     Responsibilities:
-      - Maintain an ordered list of providers
-      - Check / populate in-memory cache
-      - Apply fallback policy when resolution fails
-      - Return normalised results to route handlers
+      - Maintain an ordered list of providers (index 0 = primary)
+      - Check / populate in-memory cache before hitting any provider
+      - Apply the active FallbackStrategy when a provider fails
+      - Return normalised result dicts to route handlers
     """
 
     def __init__(self) -> None:
-        # Ordered by priority (index 0 = primary)
+        # Priority order: Piped first, Invidious as fallback
         self._providers: List[StreamProvider] = [
+            PipedProvider(),
             InvidiousProvider(),
         ]
         self._policy = DEFAULT_POLICY
@@ -50,45 +51,60 @@ class ProviderManager:
         """
         Resolve the best audio stream for video_id.
 
-        Returns a dict ready to be serialised as a JSON response:
+        1. Check in-memory cache (returns immediately on hit).
+        2. Try providers in order per the active FallbackStrategy.
+        3. Prime cache on success and return normalised response dict.
+
+        Returns a dict ready for JSONResponse:
           { success, videoId, provider, streamUrl, mimeType, container, bitrate, cache }
 
-        Raises exceptions only for programmer errors; all provider failures
-        are caught and returned as error dicts for the route to handle.
+        Raises the last provider exception on total failure (all providers exhausted).
         """
-        # ── 1. Cache check ────────────────────────────────────────────────────
+        # ── Cache check ───────────────────────────────────────────────────────
         cached = stream_cache.get(video_id)
         if cached is not None:
             log.info("[ProviderManager] Cache HIT videoId=%s", video_id)
             return {**cached, "cache": {"hit": True, "layer": "memory"}}
 
-        # ── 2. Provider resolution ────────────────────────────────────────────
-        result: Optional[ResolvedStream] = None
-        last_exc: Optional[Exception]   = None
+        # ── Provider resolution ───────────────────────────────────────────────
+        result:   Optional[ResolvedStream] = None
+        last_exc: Optional[Exception]      = None
 
         for provider in self._providers:
             try:
+                log.info(
+                    "[ProviderManager] Trying provider=%s videoId=%s",
+                    provider.name, video_id,
+                )
                 result = await provider.resolve_stream(video_id)
                 log.info(
-                    "[ProviderManager] Resolved videoId=%s via provider=%s "
+                    "[ProviderManager] Success provider=%s videoId=%s "
                     "mimeType=%s bitrate=%d",
-                    video_id, provider.name, result.mime_type, result.bitrate,
+                    provider.name, video_id,
+                    result.mime_type, result.bitrate,
                 )
-                break
+                break  # first success wins
+
             except Exception as exc:
                 last_exc = exc
                 log.warning(
-                    "[ProviderManager] Provider %s failed for videoId=%s: %s",
-                    provider.name, video_id, exc,
+                    "[ProviderManager] Provider %s failed for videoId=%s: %s — %s",
+                    provider.name, video_id,
+                    type(exc).__name__, exc,
                 )
                 if self._policy.strategy == FallbackStrategy.PRIMARY_ONLY:
-                    break  # Phase 1: do not try further providers
+                    break  # do not try next provider
+
+                log.info(
+                    "[ProviderManager] Falling back from %s → next provider",
+                    provider.name,
+                )
+                # FIRST_SUCCESS: continue to the next registered provider
 
         if result is None:
-            # Re-raise the last exception so the route can map it to HTTP codes
             raise last_exc or RuntimeError("All providers failed")
 
-        # ── 3. Build payload + prime cache ────────────────────────────────────
+        # ── Build payload + prime cache ───────────────────────────────────────
         payload = {
             "success":   True,
             "videoId":   result.video_id,
@@ -105,38 +121,49 @@ class ProviderManager:
     async def resolve_formats(self, video_id: str) -> Dict:
         """
         Return all audio formats for video_id from the primary provider.
+        Falls back to the next provider if the primary fails.
 
-        Returns a dict ready for JSON serialisation:
+        Returns a dict ready for JSONResponse:
           { success, videoId, provider, formats }
         """
-        provider = self._providers[0]
+        last_exc: Optional[Exception] = None
 
-        formats: List[AudioFormat] = await provider.resolve_formats(video_id)
-
-        log.info(
-            "[ProviderManager] resolve_formats videoId=%s provider=%s formats=%d",
-            video_id, provider.name, len(formats),
-        )
-
-        return {
-            "success":  True,
-            "videoId":  video_id,
-            "provider": provider.name,
-            "formats": [
-                {
-                    "mimeType":  f.mime_type,
-                    "container": f.container,
-                    "bitrate":   f.bitrate,
-                    "url":       f.url,
+        for provider in self._providers:
+            try:
+                formats: List[AudioFormat] = await provider.resolve_formats(video_id)
+                log.info(
+                    "[ProviderManager] resolve_formats provider=%s videoId=%s formats=%d",
+                    provider.name, video_id, len(formats),
+                )
+                return {
+                    "success":  True,
+                    "videoId":  video_id,
+                    "provider": provider.name,
+                    "formats": [
+                        {
+                            "mimeType":  f.mime_type,
+                            "container": f.container,
+                            "bitrate":   f.bitrate,
+                            "url":       f.url,
+                        }
+                        for f in formats
+                    ],
                 }
-                for f in formats
-            ],
-        }
+            except Exception as exc:
+                last_exc = exc
+                log.warning(
+                    "[ProviderManager] resolve_formats: provider %s failed for videoId=%s: %s",
+                    provider.name, video_id, exc,
+                )
+                if self._policy.strategy == FallbackStrategy.PRIMARY_ONLY:
+                    break
+
+        raise last_exc or RuntimeError("All providers failed for resolve_formats")
 
     def provider_statuses(self) -> List[ProviderStatus]:
         """Return health metadata for every registered provider."""
         return [p.status() for p in self._providers]
 
 
-# Singleton — imported once by route handlers
+# Singleton — imported once by route handlers and app.main
 provider_manager = ProviderManager()
