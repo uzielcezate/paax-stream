@@ -5,11 +5,12 @@ Service: paax-stream
 Role: Stream URL resolution + IPv6 proxy streaming for the Paax music app.
 Does NOT: metadata, search, catalog, library, or any frontend logic.
 
-Phase 6:
-  - Provider:  youtube_ipv6_proxy (IPv6 rotation, Redis sessions, Range streaming)
-  - Endpoint:  /stream/{videoId}  -- chunked .m4a audio via HTTP 206
-  - Endpoint:  /resolve/stream/{videoId}  -- JSON metadata (proxy URL)
-  - Endpoint:  /resolve/formats/{videoId} -- all audio formats (debug)
+Phase 7:
+  - Extraction: pytubefix + PO tokens (self-contained, no external APIs)
+  - Streaming:  IPv6 rotation, Redis sessions, Range streaming
+  - Endpoint:   /stream/{videoId}  -- chunked .m4a audio via HTTP 206
+  - Endpoint:   /resolve/stream/{videoId}  -- JSON metadata (proxy URL)
+  - Endpoint:   /resolve/formats/{videoId} -- all audio formats (debug)
 """
 import os
 from contextlib import asynccontextmanager
@@ -23,6 +24,7 @@ from app.config import (
     CACHE_TTL_SECONDS, get_cors_origins,
 )
 from app.providers.youtube_ipv6_proxy.ipv6_pool import pool_size, get_all_addresses
+from app.providers.youtube_ipv6_proxy.po_token_manager import po_token_manager
 from app.providers.youtube_ipv6_proxy.session_manager import session_manager
 from app.providers.youtube_ipv6_proxy.transport import transport_pool
 from app.providers.youtube_ipv6_proxy.ua_pool import ua_pool_size
@@ -38,8 +40,9 @@ log = get_logger("paax-stream")
 async def lifespan(app: FastAPI):
     # ── Startup ───────────────────────────────────────────────────────────────
     log.info("=" * 60)
-    log.info("paax-stream starting up (Phase 6 -- IPv6 Proxy)")
+    log.info("paax-stream starting up (Phase 7 -- pytubefix + PO Tokens)")
     log.info("  Provider   : %s", PROVIDER_NAME)
+    log.info("  Extraction : pytubefix (self-contained, no Invidious)")
     log.info("  Source URL  : %s", settings.SOURCE_PLATFORM_URL)
     log.info("  IPv6 pool  : %d addresses", pool_size())
     addrs = get_all_addresses()
@@ -52,13 +55,28 @@ async def lifespan(app: FastAPI):
     log.info("  Listening  : http://%s:%d", HOST, PORT)
     log.info("=" * 60)
 
-    # Connect to Redis
+    # Connect Redis for sessions + PO tokens
     await session_manager.startup()
+    await po_token_manager.startup()
+
+    # Pre-warm PO tokens so the first request isn't slow
+    try:
+        token = await po_token_manager.get_tokens()
+        log.info(
+            "  PO tokens  : READY (visitorData=%.30s...)",
+            token.visitor_data,
+        )
+    except Exception as exc:
+        log.warning(
+            "  PO tokens  : FAILED to pre-warm (%s) -- will retry on first request",
+            exc,
+        )
 
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     log.info("paax-stream shutting down.")
+    await po_token_manager.shutdown()
     await session_manager.shutdown()
     await transport_pool.shutdown()
 
@@ -67,12 +85,13 @@ app = FastAPI(
     title="paax-stream",
     description=(
         "Stream URL resolution + IPv6 proxy streaming backend for Paax. "
-        "Resolves YouTube audio (M4A itag 140) and streams via transparent "
-        "proxy with IPv6 rotation, dynamic User-Agent pool, and Redis "
-        "session management. "
+        "Resolves YouTube audio (M4A itag 140) via pytubefix with automated "
+        "PO token generation. Streams via transparent proxy with IPv6 rotation, "
+        "dynamic User-Agent pool, and Redis session management. "
+        "Fully self-contained -- no external APIs (Invidious, Piped, etc.). "
         "Does NOT handle metadata, search, or catalog."
     ),
-    version="2.1.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -102,12 +121,13 @@ app.include_router(stream_router)
 @app.get("/")
 def root():
     return {
-        "service":  "paax-stream",
-        "version":  "2.1.0",
-        "status":   "running",
-        "provider": PROVIDER_NAME,
-        "docs":     "/docs",
-        "health":   "/health",
+        "service":    "paax-stream",
+        "version":    "3.0.0",
+        "status":     "running",
+        "provider":   PROVIDER_NAME,
+        "extraction": "pytubefix + po_token",
+        "docs":       "/docs",
+        "health":     "/health",
         "endpoints": {
             "stream":   "/stream/{videoId}",
             "resolve":  "/resolve/stream/{videoId}",

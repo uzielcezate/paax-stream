@@ -34,16 +34,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from app.config import settings
 from app.providers.youtube_ipv6_proxy._cdn_cache import cdn_cache
 from app.providers.youtube_ipv6_proxy.ipv6_pool import get_random_address
-from app.providers.youtube_ipv6_proxy.resolver import resolve_m4a_url, ResolvedAudio
+from app.providers.youtube_ipv6_proxy.resolver import resolve_m4a_url, ResolvedAudio, ExtractionError
 from app.providers.youtube_ipv6_proxy.session_manager import session_manager
 from app.providers.youtube_ipv6_proxy.transport import transport_pool
 from app.utils.errors import (
     InvalidVideoIdError,
     NoAudioFormatsError,
-    InvidiousUpstreamError,
-    UpstreamRateLimitError,
-    UpstreamUnavailableError,
-    RangeNotSatisfiableError,
 )
 from app.utils.logging import get_logger
 
@@ -127,7 +123,7 @@ async def stream_audio(video_id: str, request: Request):
                 status_code=422,
                 content={"error": "NO_AUDIO_FORMATS", "detail": str(exc)},
             )
-        except InvidiousUpstreamError as exc:
+        except ExtractionError as exc:
             return JSONResponse(
                 status_code=502,
                 content={"error": "RESOLVE_FAILED", "detail": str(exc)},

@@ -1,16 +1,15 @@
 """
 app/providers/youtube_ipv6_proxy/resolver.py
-Resolves the itag-140 (.m4a, 128 kbps AAC) stream URL via Invidious API.
+Resolves the itag-140 (.m4a, 128 kbps AAC) stream URL via pytubefix.
 
-Instead of running yt-dlp locally (which requires PO tokens / login to
-bypass bot detection), we query a federated Invidious instance's public
-API to obtain the direct CDN URL for itag 140.
+Extraction is fully self-contained on the server -- no external APIs.
 
 Flow:
-  1. GET {INVIDIOUS_BASE_URL}/api/v1/videos/{video_id}
-  2. Parse the JSON response -> adaptiveFormats[]
-  3. Find the entry where itag == "140" (128 kbps AAC M4A)
-  4. Return the direct googlevideo.com CDN URL
+  1. Acquire PO tokens from Redis cache (or generate via Node.js CLI)
+  2. Initialize pytubefix.YouTube with the tokens (no interactive prompt)
+  3. Find the itag 140 stream (128 kbps AAC M4A)
+  4. Read the ``.url`` property to get the direct googlevideo.com CDN URL
+  5. Return the URL for the IPv6 streaming proxy to consume
 
 The resolved URL is an *upstream CDN URL* -- callers must NOT expose
 it to the client.  It is consumed internally by the streaming route
@@ -24,24 +23,24 @@ itag 140 spec:
 """
 from __future__ import annotations
 
+import asyncio
+import functools
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-import httpx
-
 from app.config import settings
+from app.providers.youtube_ipv6_proxy.po_token_manager import po_token_manager, POToken
 from app.utils.logging import get_logger
 from app.utils.errors import (
     InvalidVideoIdError,
     NoAudioFormatsError,
-    InvidiousUpstreamError,
-    InvidiousTimeoutError,
+    ProviderError,
 )
 
 log = get_logger(__name__)
 
 # ── Target itag ───────────────────────────────────────────────────────────────
-_ITAG_M4A_128 = "140"   # Invidious returns itag as a string
+_ITAG_M4A_128 = 140   # 128 kbps AAC in MP4 container
 
 
 @dataclass(frozen=True)
@@ -52,8 +51,12 @@ class ResolvedAudio:
     mime_type:      str             # "audio/mp4"
     container:      str             # "m4a"
     bitrate:        int             # bps
-    content_length: Optional[int] = None   # bytes, if reported by Invidious
+    content_length: Optional[int] = None   # bytes, if available
     itag:           Optional[int] = None
+
+
+class ExtractionError(ProviderError):
+    """pytubefix failed to extract stream data."""
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
@@ -69,108 +72,121 @@ def _validate_video_id(video_id: str) -> None:
         raise InvalidVideoIdError(f"Invalid videoId: '{video_id}'")
 
 
-# ── Invidious API client ─────────────────────────────────────────────────────
+# ── Synchronous extraction (runs in thread pool) ─────────────────────────────
 
-async def _fetch_invidious(video_id: str) -> Dict[str, Any]:
+def _extract_sync(video_id: str, token: POToken) -> ResolvedAudio:
     """
-    Query the Invidious API for video metadata.
-
-    Returns the full JSON response dict containing adaptiveFormats, etc.
-
-    Uses realistic desktop Chrome headers to bypass OpenResty WAF
-    on Invidious instances that block datacenter IPs with default UAs.
-
-    Raises:
-      InvidiousTimeoutError  -- request timed out
-      InvidiousUpstreamError -- non-200 response from Invidious
+    Use pytubefix to resolve the direct CDN URL for itag 140.
+    This is synchronous and MUST be called via ``run_in_executor``.
     """
-    base_url = settings.INVIDIOUS_BASE_URL.rstrip("/")
-    api_url = f"{base_url}/api/v1/videos/{video_id}"
+    try:
+        from pytubefix import YouTube
+    except ImportError as exc:
+        raise RuntimeError(
+            "pytubefix is not installed. Add 'pytubefix' to requirements.txt."
+        ) from exc
 
-    log.info("[Resolver] Querying Invidious: %s", api_url)
+    url = f"{settings.SOURCE_PLATFORM_URL.rstrip('/')}/watch?v={video_id}"
+    log.info("[Resolver] Initializing pytubefix for videoId=%s", video_id)
 
-    # ── Realistic desktop Chrome headers (WAF bypass) ─────────────────────
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.6367.118 Safari/537.36"
-        ),
-        "Accept": "application/json, text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
-    }
-
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(settings.request_timeout_s),
-        follow_redirects=True,
-    ) as client:
-        try:
-            resp = await client.get(api_url, headers=headers)
-        except httpx.TimeoutException as exc:
-            log.error(
-                "[Resolver] TIMEOUT querying %s for videoId=%s: %s",
-                base_url, video_id, exc,
-            )
-            raise InvidiousTimeoutError(
-                f"Invidious instance {base_url} timed out after "
-                f"{settings.request_timeout_s}s: {exc}"
-            ) from exc
-        except httpx.HTTPError as exc:
-            log.error(
-                "[Resolver] HTTP ERROR querying %s for videoId=%s: %s",
-                base_url, video_id, exc,
-            )
-            raise InvidiousUpstreamError(0, str(exc)) from exc
-
-    if resp.status_code != 200:
-        body = resp.text[:500]
-        log.error(
-            "[Resolver] EXTRACTION FAILED -- Invidious %s returned HTTP %d "
-            "for videoId=%s.\n"
-            "  Instance: %s\n"
-            "  Response body: %s",
-            base_url, resp.status_code, video_id, api_url, body,
+    try:
+        yt = YouTube(
+            url,
+            use_po_token=True,
+            po_token_verifier=(token.visitor_data, token.po_token),
         )
-        raise InvidiousUpstreamError(resp.status_code, body)
+    except Exception as exc:
+        log.error("[Resolver] pytubefix init failed for videoId=%s: %s", video_id, exc)
+        raise ExtractionError(f"pytubefix failed to initialize: {exc}") from exc
 
-    data: Dict[str, Any] = resp.json()
+    # ── List available streams for debug ──────────────────────────────────────
+    try:
+        all_streams = yt.streams
+    except Exception as exc:
+        log.error(
+            "[Resolver] pytubefix stream listing failed for videoId=%s: %s",
+            video_id, exc,
+        )
+        raise ExtractionError(f"Failed to list streams: {exc}") from exc
+
     log.info(
-        "[Resolver] Invidious OK for videoId=%s (title=%.50s...)",
-        video_id, data.get("title", "?"),
+        "[Resolver] videoId=%s title='%s' total_streams=%d",
+        video_id, getattr(yt, 'title', '?'), len(all_streams),
     )
-    return data
 
+    # ── Selection priority ────────────────────────────────────────────────────
+    # 1. itag 140 (gold standard)
+    stream = yt.streams.get_by_itag(_ITAG_M4A_128)
 
-# ── Format extraction helpers ────────────────────────────────────────────────
+    if stream is not None:
+        log.info("[Resolver] itag 140 found -- using it directly")
+    else:
+        # 2. Best audio-only (any format)
+        stream = yt.streams.get_audio_only()
+        if stream is not None:
+            log.warning(
+                "[Resolver] itag 140 absent -- fell back to audio_only "
+                "(itag=%s mime=%s abr=%s)",
+                stream.itag, stream.mime_type, getattr(stream, 'abr', '?'),
+            )
 
-def _normalize_mime(raw: str) -> str:
-    """'audio/mp4; codecs=\"mp4a.40.2\"' -> 'audio/mp4'"""
-    return raw.split(";")[0].strip().lower()
+    if stream is None:
+        # 3. Log all streams for debug
+        for i, s in enumerate(all_streams):
+            log.debug("[Resolver] stream[%d]: %s", i, s)
+        raise NoAudioFormatsError(
+            f"No audio streams found for videoId={video_id}. "
+            f"Total streams: {len(all_streams)}"
+        )
 
+    # ── Get the direct CDN URL (do NOT call .download()!) ─────────────────────
+    try:
+        direct_url = stream.url
+    except Exception as exc:
+        log.error("[Resolver] Failed to get stream URL for videoId=%s: %s", video_id, exc)
+        raise ExtractionError(f"Failed to get stream URL: {exc}") from exc
 
-def _extract_adaptive_formats(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Pull the adaptiveFormats array from the Invidious response.
-    Filter to audio-only entries that have a direct URL.
-    """
-    adaptive = data.get("adaptiveFormats") or []
-    audio_formats = [
-        f for f in adaptive
-        if f.get("type", "").startswith("audio/")
-        and f.get("url")
-    ]
-    return audio_formats
+    if not direct_url:
+        raise ExtractionError(f"stream.url returned empty for videoId={video_id}")
+
+    # ── Parse bitrate ─────────────────────────────────────────────────────────
+    bitrate_bps = 0
+    abr_raw = getattr(stream, 'abr', None)
+    if abr_raw and isinstance(abr_raw, str):
+        try:
+            bitrate_bps = int(abr_raw.replace("kbps", "").strip()) * 1000
+        except (ValueError, TypeError):
+            bitrate_bps = 128000  # safe default for itag 140
+
+    # ── Content length (avoid HEAD request; use approximate if available) ─────
+    clen: Optional[int] = None
+    try:
+        clen = getattr(stream, 'filesize_approx', None)
+        if clen is not None:
+            clen = int(clen)
+    except (ValueError, TypeError):
+        pass
+
+    # ── Build result ──────────────────────────────────────────────────────────
+    mime = stream.mime_type or "audio/mp4"
+    container = "m4a" if "mp4" in mime else stream.subtype or "m4a"
+
+    resolved = ResolvedAudio(
+        video_id=video_id,
+        stream_url=direct_url,
+        mime_type=mime,
+        container=container,
+        bitrate=bitrate_bps,
+        content_length=clen,
+        itag=stream.itag,
+    )
+
+    log.info(
+        "[Resolver] Resolved videoId=%s itag=%s mime=%s bitrate=%d clen=%s url=%.80s...",
+        video_id, resolved.itag, resolved.mime_type,
+        resolved.bitrate, resolved.content_length, resolved.stream_url,
+    )
+    return resolved
 
 
 # ── Public async API ──────────────────────────────────────────────────────────
@@ -178,121 +194,75 @@ def _extract_adaptive_formats(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 async def resolve_m4a_url(video_id: str) -> ResolvedAudio:
     """
     Resolve the best audio-only M4A stream URL for *video_id*
-    via the Invidious API.
+    using pytubefix + PO tokens.
 
-    Priority:
-      1. itag 140 (128 kbps AAC M4A) -- the gold standard for music.
-      2. Any other audio/mp4 format (highest bitrate wins).
-      3. Any audio format in any container (last resort).
+    Fully async -- pytubefix runs in a thread pool to avoid blocking
+    the event loop.
 
     Raises:
-      InvalidVideoIdError    -- malformed videoId
-      NoAudioFormatsError    -- no audio-only formats found
-      InvidiousUpstreamError -- Invidious API error
-      InvidiousTimeoutError  -- Invidious request timed out
+      InvalidVideoIdError -- malformed videoId
+      NoAudioFormatsError -- no audio-only formats found
+      ExtractionError     -- pytubefix failure
+      RuntimeError        -- PO token generation failure
     """
     _validate_video_id(video_id)
 
-    data = await _fetch_invidious(video_id)
-    audio_formats = _extract_adaptive_formats(data)
-
-    if not audio_formats:
-        raise NoAudioFormatsError(
-            f"No audio-only formats found for videoId={video_id}. "
-            f"adaptiveFormats count: {len(data.get('adaptiveFormats', []))}"
-        )
-
+    # 1. Get PO tokens (from Redis cache or generate fresh)
+    token = await po_token_manager.get_tokens()
     log.info(
-        "[Resolver] videoId=%s audio_formats=%d",
-        video_id, len(audio_formats),
+        "[Resolver] Using PO tokens -- visitorData=%.30s... poToken=%.30s...",
+        token.visitor_data, token.po_token,
     )
 
-    # ── Selection priority ────────────────────────────────────────────────────
-    chosen: Optional[Dict[str, Any]] = None
-
-    #  1.  itag 140
-    for f in audio_formats:
-        if str(f.get("itag")) == _ITAG_M4A_128:
-            chosen = f
-            log.info("[Resolver] itag 140 found -- using it directly")
-            break
-
-    if chosen is None:
-        #  2.  Best audio/mp4 by bitrate
-        mp4_formats = [
-            f for f in audio_formats
-            if "mp4" in _normalize_mime(f.get("type", ""))
-        ]
-        if mp4_formats:
-            chosen = max(mp4_formats, key=lambda f: int(f.get("bitrate", 0)))
-            log.info(
-                "[Resolver] itag 140 absent -- chose best audio/mp4 (itag=%s)",
-                chosen.get("itag"),
-            )
-
-    if chosen is None:
-        #  3.  Any audio format
-        chosen = max(audio_formats, key=lambda f: int(f.get("bitrate", 0)))
-        log.warning(
-            "[Resolver] No audio/mp4 -- fell back to itag=%s type=%s",
-            chosen.get("itag"), chosen.get("type"),
-        )
-
-    # ── Build result ──────────────────────────────────────────────────────────
-    raw_type = chosen.get("type", "audio/mp4")
-    mime = _normalize_mime(raw_type)
-    container = "m4a" if "mp4" in mime else mime.split("/")[-1]
-    bitrate = int(chosen.get("bitrate", 0))
-
-    # Invidious often provides clen (content-length)
-    clen: Optional[int] = None
-    clen_raw = chosen.get("clen") or chosen.get("contentLength")
-    if clen_raw is not None:
-        try:
-            clen = int(clen_raw)
-        except (ValueError, TypeError):
-            pass
-
-    itag_val: Optional[int] = None
+    # 2. Run pytubefix in thread pool (it does blocking HTTP)
+    loop = asyncio.get_event_loop()
     try:
-        itag_val = int(chosen.get("itag", 0))
-    except (ValueError, TypeError):
-        pass
+        resolved = await loop.run_in_executor(
+            None,
+            functools.partial(_extract_sync, video_id, token),
+        )
+    except (NoAudioFormatsError, InvalidVideoIdError):
+        raise  # re-raise known errors directly
+    except Exception as exc:
+        log.error(
+            "[Resolver] Extraction failed for videoId=%s: %s -- %s",
+            video_id, type(exc).__name__, exc,
+        )
+        raise
 
-    resolved = ResolvedAudio(
-        video_id=video_id,
-        stream_url=chosen["url"],
-        mime_type=mime,
-        container=container,
-        bitrate=bitrate,
-        content_length=clen,
-        itag=itag_val,
-    )
-
-    log.info(
-        "[Resolver] Resolved videoId=%s itag=%s mime=%s bitrate=%d clen=%s",
-        video_id, resolved.itag, resolved.mime_type, resolved.bitrate, resolved.content_length,
-    )
     return resolved
 
 
 async def list_audio_formats(video_id: str) -> List[Dict[str, Any]]:
     """
-    Return all audio-only formats for debug / /resolve/formats endpoint.
+    Return all audio streams for debug / /resolve/formats endpoint.
     """
     _validate_video_id(video_id)
 
-    data = await _fetch_invidious(video_id)
-    audio_formats = _extract_adaptive_formats(data)
+    token = await po_token_manager.get_tokens()
 
-    return [
-        {
-            "itag":      f.get("itag"),
-            "type":      f.get("type"),
-            "bitrate":   f.get("bitrate"),
-            "clen":      f.get("clen") or f.get("contentLength"),
-            "container": f.get("container"),
-            "url":       (f.get("url", ""))[:120] + "...",  # truncate for readability
-        }
-        for f in audio_formats
-    ]
+    def _list_sync() -> List[Dict[str, Any]]:
+        from pytubefix import YouTube
+
+        url = f"{settings.SOURCE_PLATFORM_URL.rstrip('/')}/watch?v={video_id}"
+        yt = YouTube(
+            url,
+            use_po_token=True,
+            po_token_verifier=(token.visitor_data, token.po_token),
+        )
+
+        results = []
+        for s in yt.streams:
+            if s.type == "audio":
+                results.append({
+                    "itag":      s.itag,
+                    "mime_type": s.mime_type,
+                    "abr":       getattr(s, 'abr', None),
+                    "acodec":    getattr(s, 'audio_codec', None),
+                    "filesize":  getattr(s, 'filesize_approx', None),
+                    "url":       (s.url or "")[:120] + "...",
+                })
+        return results
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _list_sync)
