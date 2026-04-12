@@ -2,13 +2,14 @@
 app/resolver/provider_manager.py
 Central orchestration layer for stream resolution.
 
-Phase 5 active provider:
-  1. YouTubeLocalMP4Provider  (first-party yt-dlp; MP4 144p/240p/360p)
+Phase 6 active provider:
+  1. YouTubeIPv6ProxyProvider  (IPv6 rotation, Redis sessions, Range streaming)
 
 Disabled (code retained for future use):
-  - CobaltProvider    (public instances unreliable)
-  - InvidiousProvider (public instances unreliable)
-  - PipedProvider     (public instances unreliable)
+  - YouTubeLocalMP4Provider (Phase 5 — direct CDN URL, no proxy)
+  - CobaltProvider          (public instances unreliable)
+  - InvidiousProvider       (public instances unreliable)
+  - PipedProvider           (public instances unreliable)
 
 Routes call provider_manager — they never import provider classes directly.
 The manager owns the in-memory cache so providers remain stateless.
@@ -16,11 +17,12 @@ The manager owns the in-memory cache so providers remain stateless.
 from typing import Dict, List, Optional
 
 from app.providers.base import StreamProvider, ResolvedStream, AudioFormat, ProviderStatus
-from app.providers.youtube_local_mp4.provider import YouTubeLocalMP4Provider
+from app.providers.youtube_ipv6_proxy.provider import YouTubeIPv6ProxyProvider
 # ---------------------------------------------------------------------------
-# Public-instance providers are disabled from runtime (Phase 5).
+# Disabled providers — code retained, not loaded at runtime.
 # Un-comment and add to _providers below to re-enable any of them.
 # ---------------------------------------------------------------------------
+# from app.providers.youtube_local_mp4.provider import YouTubeLocalMP4Provider
 # from app.providers.cobalt.provider import CobaltProvider
 # from app.providers.invidious.provider import InvidiousProvider
 # from app.providers.piped.provider import PipedProvider
@@ -43,16 +45,17 @@ class ProviderManager:
     """
 
     def __init__(self) -> None:
-        # ── Active providers (Phase 5) ────────────────────────────────────
-        # First-party local resolver is the only active provider.
-        # Public providers remain commented out / disabled.
+        # ── Active providers (Phase 6) ────────────────────────────────────
+        # IPv6 proxy is the only active provider.
+        # All other providers remain commented out / disabled.
         #
         # DISABLED (code retained, not loaded at runtime):
-        #   CobaltProvider()    — re-enable when reliable
-        #   InvidiousProvider() — re-enable when reliable
-        #   PipedProvider()     — re-enable when reliable
+        #   YouTubeLocalMP4Provider() — Phase 5 (direct CDN URL, no proxy)
+        #   CobaltProvider()          — public instances unreliable
+        #   InvidiousProvider()       — public instances unreliable
+        #   PipedProvider()           — public instances unreliable
         self._providers: List[StreamProvider] = [
-            YouTubeLocalMP4Provider(),  # primary — yt-dlp, MP4 144p/240p/360p
+            YouTubeIPv6ProxyProvider(),  # primary — IPv6 rotation + Range proxy
         ]
         self._policy = DEFAULT_POLICY
         log.info(
@@ -112,7 +115,7 @@ class ProviderManager:
                     break  # do not try next provider
 
                 log.info(
-                    "[ProviderManager] Falling back from %s → next provider",
+                    "[ProviderManager] Falling back from %s -> next provider",
                     provider.name,
                 )
                 # FIRST_SUCCESS: continue to the next registered provider

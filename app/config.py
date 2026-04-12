@@ -1,52 +1,100 @@
 """
-app/config.py — Environment-based configuration for paax-stream.
-All values can be overridden via environment variables or a .env file.
+app/config.py — Typed, validated configuration via pydantic-settings.
+
+All values are read from environment variables or a .env file.
+Import ``settings`` anywhere you need a config value:
+
+    from app.config import settings
+    print(settings.REDIS_URL)
+
+Legacy module-level constants (PORT, HOST, …) are re-exported for backward
+compatibility with existing imports.
 """
-import os
+from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# Invidious provider
-# ---------------------------------------------------------------------------
+from typing import List
 
-INVIDIOUS_BASE_URL: str = os.getenv(
-    "INVIDIOUS_BASE_URL", "https://invidious.nerdvpn.de"
-).rstrip("/")
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-PROVIDER_NAME: str = "invidious-nerdvpn"
 
-# ---------------------------------------------------------------------------
-# HTTP client
-# ---------------------------------------------------------------------------
+class Settings(BaseSettings):
+    """
+    Central configuration object.
+    Env vars are matched case-insensitively; .env file is loaded automatically.
+    """
 
-REQUEST_TIMEOUT_S: float = float(os.getenv("REQUEST_TIMEOUT_MS", "8000")) / 1000
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",               # ignore unknown env vars
+    )
 
-# ---------------------------------------------------------------------------
-# Cache (in-memory)
-# ---------------------------------------------------------------------------
+    # ── Source platform (domain-agnostic) ─────────────────────────────────────
+    SOURCE_PLATFORM_URL: str = "https://www.youtube.com"
 
-CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "600"))
+    # ── IPv6 rotation ─────────────────────────────────────────────────────────
+    IPV6_SUBNET_BASE: str = "2604:A880:0004:01D0:0000:0002:7D72:C000"
+    IPV6_POOL_SIZE: int = 16
 
-# ---------------------------------------------------------------------------
-# Server
-# ---------------------------------------------------------------------------
+    # ── Redis ─────────────────────────────────────────────────────────────────
+    REDIS_URL: str = "redis://localhost:6379/0"
+    SESSION_COOKIE_TTL: int = 1800          # seconds
 
-PORT: int  = int(os.getenv("PORT", 8080))
-HOST: str  = "0.0.0.0"
+    # ── Streaming ─────────────────────────────────────────────────────────────
+    STREAM_CHUNK_SIZE: int = 65_536         # 64 KiB
+    UPSTREAM_TIMEOUT_S: float = 15.0
 
-# ---------------------------------------------------------------------------
-# CORS
-# ---------------------------------------------------------------------------
+    # ── Invidious / legacy provider ───────────────────────────────────────────
+    INVIDIOUS_BASE_URL: str = "https://invidious.nerdvpn.de"
 
-FRONTEND_ORIGINS_RAW: str = os.getenv("FRONTEND_ORIGINS", "*")
+    # ── HTTP client ───────────────────────────────────────────────────────────
+    REQUEST_TIMEOUT_MS: int = 8000
+
+    # ── In-memory cache ───────────────────────────────────────────────────────
+    CACHE_TTL_SECONDS: int = 600
+
+    # ── CORS ──────────────────────────────────────────────────────────────────
+    FRONTEND_ORIGINS: str = "*"
+
+    # ── Server ────────────────────────────────────────────────────────────────
+    PORT: int = 8080
+    HOST: str = "0.0.0.0"
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    LOG_LEVEL: str = "info"
+
+    # ── Derived helpers ───────────────────────────────────────────────────────
+
+    @property
+    def request_timeout_s(self) -> float:
+        """REQUEST_TIMEOUT_MS converted to seconds."""
+        return self.REQUEST_TIMEOUT_MS / 1000
+
+    def get_cors_origins(self) -> List[str]:
+        """Parse FRONTEND_ORIGINS into a list.  '*' means allow all."""
+        raw = self.FRONTEND_ORIGINS.strip()
+        if raw == "*":
+            return ["*"]
+        return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+# ── Singleton ─────────────────────────────────────────────────────────────────
+settings = Settings()
+
+# ── Backward-compatible module-level re-exports ──────────────────────────────
+# Existing code does:  from app.config import PORT, HOST, ...
+# These aliases keep that working without mass-refactoring every import site.
+
+PORT: int = settings.PORT
+HOST: str = settings.HOST
+PROVIDER_NAME: str = "youtube_ipv6_proxy"
+INVIDIOUS_BASE_URL: str = settings.INVIDIOUS_BASE_URL.rstrip("/")
+REQUEST_TIMEOUT_S: float = settings.request_timeout_s
+CACHE_TTL_SECONDS: int = settings.CACHE_TTL_SECONDS
+FRONTEND_ORIGINS_RAW: str = settings.FRONTEND_ORIGINS
+LOG_LEVEL: str = settings.LOG_LEVEL.upper()
+
 
 def get_cors_origins() -> list[str]:
-    """Parse FRONTEND_ORIGINS into a list. '*' means allow all."""
-    if FRONTEND_ORIGINS_RAW.strip() == "*":
-        return ["*"]
-    return [o.strip() for o in FRONTEND_ORIGINS_RAW.split(",") if o.strip()]
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-LOG_LEVEL: str = os.getenv("LOG_LEVEL", "info").upper()
+    """Backward-compatible wrapper."""
+    return settings.get_cors_origins()
