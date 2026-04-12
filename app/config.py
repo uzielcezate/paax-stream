@@ -44,8 +44,8 @@ class Settings(BaseSettings):
     STREAM_CHUNK_SIZE: int = 65_536         # 64 KiB
     UPSTREAM_TIMEOUT_S: float = 15.0
 
-    # ── Invidious / legacy provider ───────────────────────────────────────────
-    INVIDIOUS_BASE_URL: str = "https://invidious.nerdvpn.de"
+    # ── Invidious API (extraction backend) ───────────────────────────────────
+    INVIDIOUS_BASE_URL: str = "https://yewtu.be"
 
     # ── HTTP client ───────────────────────────────────────────────────────────
     REQUEST_TIMEOUT_MS: int = 8000
