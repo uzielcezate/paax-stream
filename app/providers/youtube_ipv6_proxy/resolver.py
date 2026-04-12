@@ -77,6 +77,9 @@ async def _fetch_invidious(video_id: str) -> Dict[str, Any]:
 
     Returns the full JSON response dict containing adaptiveFormats, etc.
 
+    Uses realistic desktop Chrome headers to bypass OpenResty WAF
+    on Invidious instances that block datacenter IPs with default UAs.
+
     Raises:
       InvidiousTimeoutError  -- request timed out
       InvidiousUpstreamError -- non-200 response from Invidious
@@ -86,34 +89,58 @@ async def _fetch_invidious(video_id: str) -> Dict[str, Any]:
 
     log.info("[Resolver] Querying Invidious: %s", api_url)
 
+    # ── Realistic desktop Chrome headers (WAF bypass) ─────────────────────
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.6367.118 Safari/537.36"
+        ),
+        "Accept": "application/json, text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
+    }
+
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(settings.request_timeout_s),
         follow_redirects=True,
     ) as client:
         try:
-            resp = await client.get(
-                api_url,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                },
-            )
+            resp = await client.get(api_url, headers=headers)
         except httpx.TimeoutException as exc:
-            log.error("[Resolver] Invidious timeout for videoId=%s: %s", video_id, exc)
-            raise InvidiousTimeoutError(f"Invidious request timed out: {exc}") from exc
+            log.error(
+                "[Resolver] TIMEOUT querying %s for videoId=%s: %s",
+                base_url, video_id, exc,
+            )
+            raise InvidiousTimeoutError(
+                f"Invidious instance {base_url} timed out after "
+                f"{settings.request_timeout_s}s: {exc}"
+            ) from exc
         except httpx.HTTPError as exc:
-            log.error("[Resolver] Invidious HTTP error for videoId=%s: %s", video_id, exc)
+            log.error(
+                "[Resolver] HTTP ERROR querying %s for videoId=%s: %s",
+                base_url, video_id, exc,
+            )
             raise InvidiousUpstreamError(0, str(exc)) from exc
 
     if resp.status_code != 200:
         body = resp.text[:500]
         log.error(
-            "[Resolver] Invidious returned HTTP %d for videoId=%s: %s",
-            resp.status_code, video_id, body,
+            "[Resolver] EXTRACTION FAILED -- Invidious %s returned HTTP %d "
+            "for videoId=%s.\n"
+            "  Instance: %s\n"
+            "  Response body: %s",
+            base_url, resp.status_code, video_id, api_url, body,
         )
         raise InvidiousUpstreamError(resp.status_code, body)
 

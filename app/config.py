@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     UPSTREAM_TIMEOUT_S: float = 15.0
 
     # ── Invidious API (extraction backend) ───────────────────────────────────
-    INVIDIOUS_BASE_URL: str = "https://yewtu.be"
+    INVIDIOUS_BASE_URL: str = "https://invidious.nerdvpn.de"
 
     # ── HTTP client ───────────────────────────────────────────────────────────
     REQUEST_TIMEOUT_MS: int = 8000
