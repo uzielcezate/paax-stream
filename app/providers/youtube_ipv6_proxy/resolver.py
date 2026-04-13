@@ -92,8 +92,9 @@ def _extract_sync(video_id: str, token: POToken) -> ResolvedAudio:
     try:
         yt = YouTube(
             url,
+            client='WEB',
             use_po_token=True,
-            po_token_verifier=(token.visitor_data, token.po_token),
+            po_token_verifier=lambda: (token.visitor_data, token.po_token),
         )
     except Exception as exc:
         log.error("[Resolver] pytubefix init failed for videoId=%s: %s", video_id, exc)
@@ -247,8 +248,9 @@ async def list_audio_formats(video_id: str) -> List[Dict[str, Any]]:
         url = f"{settings.SOURCE_PLATFORM_URL.rstrip('/')}/watch?v={video_id}"
         yt = YouTube(
             url,
+            client='WEB',
             use_po_token=True,
-            po_token_verifier=(token.visitor_data, token.po_token),
+            po_token_verifier=lambda: (token.visitor_data, token.po_token),
         )
 
         results = []
