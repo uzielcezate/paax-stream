@@ -1,51 +1,57 @@
 """
 app/routes/stream.py
-Core streaming endpoint -- HTTP 206 Range Request proxy.
+Pure IPv6 streaming proxy -- HTTP 206 Range Request support.
 
-GET /stream/{video_id}
+GET /stream?url=<encoded_googlevideo_url>
+
+Hybrid Architecture:
+  The Flutter client extracts the raw CDN URL using youtube_explode_dart
+  (on a residential IP, bypassing datacenter blocks).  It then passes that
+  URL to this endpoint.  The server's ONLY job is to proxy the bytes
+  through our IPv6 rotation pool with realistic device fingerprints.
 
 Flow:
-  1. Parse the client's ``Range`` header.
-  2. Look up the resolved CDN URL from the in-memory cache (populated by
-     the provider's ``resolve_stream()``).  If missing, resolve on the fly.
-  3. Pick a random IPv6 from the pool.
-  4. Acquire session (cookies + sticky User-Agent) for that IPv6 from Redis.
-  5. Open an httpx streaming request to the CDN, forwarding the Range header
-     using the session's sticky UA so the IPv6 always looks like the same device.
-  6. Yield chunks back to the client via ``StreamingResponse``.
+  1. Receive the raw CDN URL from the client (query param).
+  2. Validate it's a legitimate googlevideo.com URL (anti-abuse).
+  3. Parse the client's ``Range`` header.
+  4. Pick a random IPv6 from the pool.
+  5. Acquire session (cookies + sticky User-Agent) for that IPv6.
+  6. Open an httpx streaming request to the CDN, forwarding the Range.
+  7. Yield 64KB chunks back via ``StreamingResponse``.
 
 Headers returned:
   - ``Accept-Ranges: bytes``
   - ``Content-Range: bytes START-END/TOTAL``
   - ``Content-Length``
   - ``Content-Type: audio/mp4``
-
-This allows ``just_audio`` (ExoPlayer) to seek freely.
 """
 from __future__ import annotations
 
 import re
 from typing import AsyncIterator, Optional, Tuple
+from urllib.parse import urlparse, unquote
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import settings
-from app.providers.youtube_ipv6_proxy._cdn_cache import cdn_cache
 from app.providers.youtube_ipv6_proxy.ipv6_pool import get_random_address
-from app.providers.youtube_ipv6_proxy.resolver import resolve_m4a_url, ResolvedAudio, ExtractionError
 from app.providers.youtube_ipv6_proxy.session_manager import session_manager
 from app.providers.youtube_ipv6_proxy.transport import transport_pool
-from app.utils.errors import (
-    InvalidVideoIdError,
-    NoAudioFormatsError,
-)
 from app.utils.logging import get_logger
 
 log = get_logger(__name__)
 
 router = APIRouter()
+
+# ── Allowed CDN hostnames (anti-abuse: prevents open proxy) ───────────────────
+_ALLOWED_HOSTS = (
+    ".googlevideo.com",
+    ".youtube.com",
+    ".ytimg.com",
+    ".ggpht.com",
+)
 
 # ── Range header regex ────────────────────────────────────────────────────────
 _RANGE_RE = re.compile(r"bytes=(\d+)-(\d*)")
@@ -67,6 +73,16 @@ def _parse_range(header: Optional[str]) -> Optional[Tuple[int, Optional[int]]]:
     return (start, end)
 
 
+def _is_allowed_url(url: str) -> bool:
+    """Validate that the URL points to a legitimate Google CDN host."""
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        return any(host.endswith(allowed) for allowed in _ALLOWED_HOSTS)
+    except Exception:
+        return False
+
+
 # ── Streaming generator ──────────────────────────────────────────────────────
 
 async def _stream_chunks(
@@ -85,74 +101,67 @@ async def _stream_chunks(
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 
 @router.get(
-    "/stream/{video_id}",
-    summary="Stream audio via IPv6 proxy (supports Range requests)",
+    "/stream",
+    summary="IPv6 streaming proxy (accepts raw CDN URL from client)",
     responses={
         200: {"description": "Full audio stream (no Range header)"},
         206: {"description": "Partial audio stream (Range header)"},
-        400: {"description": "Invalid video ID"},
+        400: {"description": "Missing or invalid URL"},
+        403: {"description": "CDN rejected the request"},
         416: {"description": "Range not satisfiable"},
         429: {"description": "Upstream rate-limited"},
         502: {"description": "Upstream unavailable"},
     },
 )
-async def stream_audio(video_id: str, request: Request):
+async def stream_audio(
+    request: Request,
+    url: str = Query(
+        ...,
+        description="URL-encoded googlevideo.com CDN audio URL (provided by the client)",
+    ),
+):
     """
-    Stream ``.m4a`` audio for *video_id*.
+    Proxy audio bytes from a raw CDN URL through the IPv6 rotation pool.
+
+    The Flutter client extracts the CDN URL via youtube_explode_dart and
+    passes it here.  The server adds IPv6 rotation + device fingerprinting.
 
     Supports ``Range`` requests for seamless seeking in mobile players.
     Audio bytes are proxied iteratively -- never buffered to disk or RAM.
     """
-    video_id = video_id.strip()
-    log.info("[stream] -> videoId=%s", video_id)
+    # ── 1. Validate the CDN URL ───────────────────────────────────────────────
+    cdn_url = unquote(url).strip()
 
-    # ── 1. Resolve CDN URL ────────────────────────────────────────────────────
-    resolved: Optional[ResolvedAudio] = cdn_cache.get(video_id)
-    if resolved is None:
-        log.info("[stream] CDN cache miss for %s -- resolving", video_id)
-        try:
-            resolved = await resolve_m4a_url(video_id)
-            cdn_cache.set(video_id, resolved)
-        except InvalidVideoIdError as exc:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "INVALID_VIDEO_ID", "detail": str(exc)},
-            )
-        except NoAudioFormatsError as exc:
-            return JSONResponse(
-                status_code=422,
-                content={"error": "NO_AUDIO_FORMATS", "detail": str(exc)},
-            )
-        except ExtractionError as exc:
-            return JSONResponse(
-                status_code=502,
-                content={"error": "RESOLVE_FAILED", "detail": str(exc)},
-            )
-        except Exception as exc:
-            log.error("[stream] Unexpected resolve error: %s", exc)
-            return JSONResponse(
-                status_code=502,
-                content={"error": "RESOLVE_FAILED", "detail": str(exc)},
-            )
+    if not cdn_url:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "MISSING_URL", "detail": "The 'url' query parameter is required."},
+        )
 
-    cdn_url = resolved.stream_url
-    log.info(
-        "[stream] CDN URL ready for %s (itag=%s, bitrate=%d)",
-        video_id, resolved.itag, resolved.bitrate,
-    )
+    if not _is_allowed_url(cdn_url):
+        log.warning("[stream] Rejected non-Google URL: %.100s...", cdn_url)
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "INVALID_URL",
+                "detail": "URL must point to a Google CDN host (*.googlevideo.com).",
+            },
+        )
+
+    log.info("[stream] -> url=%.80s...", cdn_url)
 
     # ── 2. Parse client Range ─────────────────────────────────────────────────
     range_header = request.headers.get("range")
     parsed_range = _parse_range(range_header)
-    log.info("[stream] Client Range: %s -> parsed=%s", range_header, parsed_range)
+    log.debug("[stream] Client Range: %s -> parsed=%s", range_header, parsed_range)
 
     # ── 3. Pick IPv6 + acquire session (cookies + sticky UA) ──────────────────
     ipv6 = get_random_address()
     client = transport_pool.get_client(ipv6)
     session = await session_manager.acquire_session(ipv6, http_client=client)
     log.info(
-        "[stream] Using IPv6=%s cookies=%d ua=%.50s...",
-        ipv6, len(session.cookies), session.user_agent,
+        "[stream] IPv6=%s ua=%.50s...",
+        ipv6, session.user_agent,
     )
 
     # ── 4. Build upstream request (using session's sticky UA) ─────────────────
@@ -179,13 +188,13 @@ async def stream_audio(video_id: str, request: Request):
             stream=True,
         )
     except httpx.TimeoutException as exc:
-        log.error("[stream] Upstream timeout for %s via %s: %s", video_id, ipv6, exc)
+        log.error("[stream] Upstream timeout via %s: %s", ipv6, exc)
         return JSONResponse(
             status_code=504,
             content={"error": "UPSTREAM_TIMEOUT", "detail": str(exc)},
         )
     except httpx.HTTPError as exc:
-        log.error("[stream] Upstream HTTP error for %s via %s: %s", video_id, ipv6, exc)
+        log.error("[stream] Upstream HTTP error via %s: %s", ipv6, exc)
         return JSONResponse(
             status_code=502,
             content={"error": "UPSTREAM_ERROR", "detail": str(exc)},
@@ -197,7 +206,7 @@ async def stream_audio(video_id: str, request: Request):
     if us == 429:
         await upstream_resp.aclose()
         retry_after = upstream_resp.headers.get("Retry-After")
-        log.warning("[stream] 429 rate-limited on %s for %s", ipv6, video_id)
+        log.warning("[stream] 429 rate-limited on %s", ipv6)
         return JSONResponse(
             status_code=429,
             content={"error": "RATE_LIMITED", "detail": f"IPv6 {ipv6} rate-limited"},
@@ -206,7 +215,7 @@ async def stream_audio(video_id: str, request: Request):
 
     if us in (502, 503):
         await upstream_resp.aclose()
-        log.warning("[stream] Upstream %d for %s via %s", us, video_id, ipv6)
+        log.warning("[stream] Upstream %d via %s", us, ipv6)
         return JSONResponse(
             status_code=502,
             content={"error": "UPSTREAM_UNAVAILABLE", "detail": f"CDN returned {us}"},
@@ -214,7 +223,7 @@ async def stream_audio(video_id: str, request: Request):
 
     if us == 416:
         await upstream_resp.aclose()
-        log.warning("[stream] 416 Range not satisfiable for %s", video_id)
+        log.warning("[stream] 416 Range not satisfiable")
         return JSONResponse(
             status_code=416,
             content={"error": "RANGE_NOT_SATISFIABLE", "detail": range_header},
@@ -222,28 +231,30 @@ async def stream_audio(video_id: str, request: Request):
 
     if us == 403:
         await upstream_resp.aclose()
-        # Invalidate cookies and CDN URL -- they're stale
-        cdn_cache.delete(video_id)
-        log.warning("[stream] 403 from CDN for %s via %s -- cache invalidated", video_id, ipv6)
+        log.warning("[stream] 403 from CDN via %s", ipv6)
         return JSONResponse(
             status_code=403,
-            content={"error": "CDN_FORBIDDEN", "detail": "Stream URL expired or blocked. Retry."},
+            content={"error": "CDN_FORBIDDEN", "detail": "CDN rejected the request. URL may be expired."},
         )
 
     if us not in (200, 206):
         await upstream_resp.aclose()
-        log.error("[stream] Unexpected upstream status %d for %s", us, video_id)
+        log.error("[stream] Unexpected upstream status %d", us)
         return JSONResponse(
             status_code=502,
             content={"error": "UPSTREAM_ERROR", "detail": f"Unexpected HTTP {us}"},
         )
 
     # ── 7. Build response headers ─────────────────────────────────────────────
+    # Detect content type from upstream or default to audio/mp4
+    upstream_ct = upstream_resp.headers.get("content-type", "audio/mp4")
+    media_type = upstream_ct.split(";")[0].strip()
+
     resp_headers: dict[str, str] = {
         "Accept-Ranges": "bytes",
-        "Content-Type": resolved.mime_type or "audio/mp4",
+        "Content-Type": media_type,
         "X-Proxy-IPv6": ipv6,
-        "X-Provider": "youtube_ipv6_proxy",
+        "X-Provider": "ipv6_proxy",
     }
 
     # Forward Content-Range from upstream (present on 206)
@@ -259,8 +270,8 @@ async def stream_audio(video_id: str, request: Request):
     status_code = upstream_resp.status_code  # 200 or 206
 
     log.info(
-        "[stream] Streaming %s -> client (status=%d range=%s clen=%s ipv6=%s)",
-        video_id, status_code, content_range, content_length, ipv6,
+        "[stream] Proxying -> client (status=%d range=%s clen=%s ipv6=%s)",
+        status_code, content_range, content_length, ipv6,
     )
 
     # ── 8. Stream! ────────────────────────────────────────────────────────────
@@ -268,5 +279,5 @@ async def stream_audio(video_id: str, request: Request):
         content=_stream_chunks(upstream_resp, settings.STREAM_CHUNK_SIZE),
         status_code=status_code,
         headers=resp_headers,
-        media_type=resolved.mime_type or "audio/mp4",
+        media_type=media_type,
     )
